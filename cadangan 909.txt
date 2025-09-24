@@ -1,0 +1,903 @@
+// App.jsx
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+/**
+ * GreenMiles — Full demo single-file React app
+ * - Lazy-load react-leaflet & leaflet (peta hanya di-load kalau diperlukan)
+ * - Dummy data preloaded
+ * - localStorage persistence
+ * - GPS tracking (watchPosition) -> simpan rute -> hitung jarak (haversine)
+ * - Responsive bottom nav (5 main tabs on mobile)
+ *
+ * Requirements:
+ *  - npm install react-leaflet leaflet
+ *  - include leaflet CSS: you can import it in index.css or let the code inject it (this file injects on demand)
+ */
+
+/* ============================
+   CONFIG & HELPERS
+   ============================ */
+const STORAGE_KEY = "greenmiles_full_demo_v1";
+
+const CO2_FACTORS_G_PER_KM = {
+  walk: 0,
+  bike: 0,
+  bus: 70,
+  krl: 70,
+  mrt: 65,
+  motorcycle: 100,
+  car: 150,
+};
+
+const MODE_LABELS = {
+  walk: "Jalan Kaki",
+  bike: "Sepeda",
+  bus: "Bus",
+  krl: "KRL/Commuter",
+  mrt: "MRT",
+  motorcycle: "Motor",
+  car: "Mobil",
+};
+
+const POINTS_PER_KM = {
+  walk: 10,
+  bike: 8,
+  bus: 5,
+  krl: 5,
+  mrt: 5,
+  motorcycle: 0,
+  car: 0,
+};
+
+function km(n) { return Number(n || 0); }
+function fmt(n) { return new Intl.NumberFormat("id-ID").format(Math.round(n)); }
+function todayISO() { return new Date().toISOString().split("T")[0]; }
+function getWeekIndex(d) {
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil(((date - yearStart) / 86400000 + 1) / 7);
+  return `${date.getUTCFullYear()}-W${String(weekNo).padStart(2, "0")}`;
+}
+function getMonthIndex(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2,"0")}`; }
+
+function calcTrip({ mode, distanceKm, baselineMode = "car" }) {
+  const dist = km(distanceKm);
+  const factor = CO2_FACTORS_G_PER_KM[mode] ?? 0;
+  const baselineFactor = CO2_FACTORS_G_PER_KM[baselineMode] ?? 150;
+  const co2Gram = dist * factor;
+  const baselineGram = dist * baselineFactor;
+  const co2SavedGram = Math.max(0, baselineGram - co2Gram);
+  const points = Math.round(dist * (POINTS_PER_KM[mode] ?? 0));
+  return { co2Gram, co2SavedGram, points };
+}
+function computeTier(totalGreenKm) {
+  if (totalGreenKm >= 5000) return "Platinum";
+  if (totalGreenKm >= 1000) return "Gold";
+  if (totalGreenKm >= 500) return "Silver";
+  return "Bronze";
+}
+
+/* ============================
+   Dummy initial data
+   ============================ */
+const dummyTrips = [
+  { id: "t-walk-1", date: todayISO(), mode: "walk", distanceKm: 3.2, durationMin: 40, note: "Jalan pagi" },
+  { id: "t-bike-1", date: todayISO(), mode: "bike", distanceKm: 5.5, durationMin: 25, note: "Sepeda ke kantor" },
+  { id: "t-bus-1", date: todayISO(), mode: "bus", distanceKm: 10.1, durationMin: 35, note: "Naik bus trans" },
+  { id: "t-motor-1", date: todayISO(), mode: "motorcycle", distanceKm: 8.3, durationMin: 20, note: "Antar barang" },
+  { id: "t-car-1", date: todayISO(), mode: "car", distanceKm: 12.0, durationMin: 30, note: "Jalan jauh" },
+].map(t => ({ ...t, ...calcTrip(t) }));
+
+const dummyModels = [
+  { id: "m1", name: "Model Moda Deteksi v1", category: "Computer Vision", status: "Ready", accuracy: 0.87 },
+  { id: "m2", name: "Estimasi Emisi v0.3", category: "Regression", status: "Training", accuracy: 0.0 },
+  { id: "m3", name: "Classifier Transport", category: "Classification", status: "Ready", accuracy: 0.79 },
+];
+
+const dummyRequests = [
+  { id: "req1", title: "Dataset CCTV Terminal", uploader: "Ayu", date: "2025-07-20", status: "Approved", notes: "Format COCO" },
+  { id: "req2", title: "GPS Traces Jakarta", uploader: "Budi", date: "2025-08-01", status: "Pending", notes: "CSV/GeoJSON" },
+];
+
+/* ============================
+   localStorage helpers
+   ============================ */
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      const initial = {
+        user: { name: "Kamu", tier: "Bronze" },
+        trips: dummyTrips,
+        totals: {
+          distanceKm: dummyTrips.reduce((a, t) => a + t.distanceKm, 0),
+          co2Gram: dummyTrips.reduce((a, t) => a + t.co2Gram, 0),
+          co2SavedGram: dummyTrips.reduce((a, t) => a + t.co2SavedGram, 0),
+          points: 1000,
+        },
+        challenges: {
+          dailyWalkKm: dummyTrips.filter(t=>t.mode==='walk').reduce((a,t)=>a+t.distanceKm,0),
+          weeklyTransitCount: dummyTrips.filter(t=>['bus','krl','mrt'].includes(t.mode)).length,
+          monthlyReductionPct: 45,
+          lastDaily: todayISO(),
+          weekIndex: getWeekIndex(new Date()),
+          monthIndex: getMonthIndex(new Date()),
+        },
+        rewards: [
+          { id: "r1", name: "Voucher KRL Rp10.000", cost: 500, stock: 10 },
+          { id: "r2", name: "Diskon Kopi 20%", cost: 400, stock: 5 },
+          { id: "r3", name: "Cashback Rp5.000", cost: 600, stock: 3 },
+        ],
+        leaderboard: [
+          { id: "u1", name: "Karin", points: 3200 },
+          { id: "u2", name: "Rizky", points: 2800 },
+          { id: "me", name: "Kamu", points: 1000 },
+        ],
+        models: dummyModels,
+        requests: dummyRequests,
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
+      return initial;
+    }
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn("loadState err", e);
+    return {
+      user: { name: "Kamu", tier: "Bronze" },
+      trips: dummyTrips,
+      totals: { distanceKm: 0, co2Gram: 0, co2SavedGram: 0, points: 0 },
+      challenges: { dailyWalkKm: 0, weeklyTransitCount: 0, monthlyReductionPct: 0, lastDaily: todayISO(), weekIndex: getWeekIndex(new Date()), monthIndex: getMonthIndex(new Date()) },
+      rewards: [],
+      leaderboard: [],
+      models: [],
+      requests: [],
+    };
+  }
+}
+function saveState(state) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch (e) {
+    console.warn("saveState err", e);
+  }
+}
+
+/* ============================
+   Lazy-load Leaflet (react-leaflet)
+   ============================ */
+let LeafletLibs = { MapContainer: null, TileLayer: null, Marker: null, Polyline: null, Popup: null };
+let L = null;
+async function ensureLeaflet() {
+  if (!LeafletLibs.MapContainer) {
+    try {
+      const rl = await import("react-leaflet");
+      const leaflet = await import("leaflet");
+      LeafletLibs = {
+        MapContainer: rl.MapContainer,
+        TileLayer: rl.TileLayer,
+        Marker: rl.Marker,
+        Polyline: rl.Polyline,
+        Popup: rl.Popup,
+      };
+      L = leaflet.default || leaflet;
+      // Inject CSS
+      if (!document.getElementById("leaflet-css")) {
+        const link = document.createElement("link");
+        link.id = "leaflet-css";
+        link.rel = "stylesheet";
+        link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+        document.head.appendChild(link);
+      }
+      // Fix default icon paths
+      const iconRetinaUrl = "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png";
+      const iconUrl = "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png";
+      const shadowUrl = "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png";
+      L.Icon.Default.mergeOptions({ iconRetinaUrl, iconUrl, shadowUrl });
+    } catch (e) {
+      console.warn("Leaflet lazy import failed", e);
+    }
+  }
+}
+
+/* ============================
+   Haversine distance
+   ============================ */
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const toRad = (v) => (v * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+function calcRouteDistance(route) {
+  if (!route || route.length < 2) return 0;
+  let total = 0;
+  for (let i = 1; i < route.length; i++) {
+    total += haversineKm(route[i - 1].lat, route[i - 1].lng, route[i].lat, route[i].lng);
+  }
+  return total;
+}
+
+/* ============================
+   Main App
+   ============================ */
+export default function App() {
+  const [state, setState] = useState(() => loadState());
+  const [activeTab, setActiveTab] = useState("dashboard");
+  const [leafletReady, setLeafletReady] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+
+  // persist whenever state changes
+  useEffect(() => { saveState(state); }, [state]);
+
+  // responsive detection
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth <= 640);
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // recompute tier based on green km
+  const greenKm = useMemo(() => {
+    return state.trips.filter(t => ["walk","bike","bus","krl","mrt"].includes(t.mode)).reduce((a,t) => a + (t.distanceKm||0), 0);
+  }, [state.trips]);
+
+  useEffect(() => {
+    const tier = computeTier(greenKm);
+    if (tier !== state.user.tier) {
+      setState(s => ({ ...s, user: { ...s.user, tier } }));
+    }
+  }, [greenKm]);
+
+  // functions: addTrip, redeem, addRequest, addModel
+  const addTrip = (trip) => {
+    const { co2Gram, co2SavedGram, points } = calcTrip(trip);
+    const t = {
+      id: crypto.randomUUID(),
+      date: todayISO(),
+      durationMin: trip.durationMin || Math.round(trip.distanceKm * 2.5),
+      ...trip,
+      co2Gram, co2SavedGram, points
+    };
+    setState(s => {
+      const newTrips = [t, ...s.trips];
+      const totals = {
+        distanceKm: s.totals.distanceKm + t.distanceKm,
+        co2Gram: s.totals.co2Gram + t.co2Gram,
+        co2SavedGram: s.totals.co2SavedGram + t.co2SavedGram,
+        points: s.totals.points + t.points,
+      };
+      const challenges = { ...s.challenges };
+      if (t.mode === "walk") challenges.dailyWalkKm += t.distanceKm;
+      if (["bus","krl","mrt"].includes(t.mode)) challenges.weeklyTransitCount += 1;
+      const leaderboard = s.leaderboard.map(u => u.id === "me" ? { ...u, name: s.user.name || "Kamu", points: totals.points } : u);
+      return { ...s, trips: newTrips, totals, challenges, leaderboard };
+    });
+  };
+
+  const redeem = (rewardId) => {
+    setState(s => {
+      const r = s.rewards.find(x => x.id === rewardId);
+      if (!r || r.stock <= 0 || s.totals.points < r.cost) return s;
+      const rewards = s.rewards.map(x => x.id === rewardId ? { ...x, stock: x.stock - 1 } : x);
+      const totals = { ...s.totals, points: s.totals.points - r.cost };
+      const leaderboard = s.leaderboard.map(u => u.id === "me" ? { ...u, points: totals.points } : u);
+      return { ...s, rewards, totals, leaderboard };
+    });
+  };
+
+  const addRequest = (req) => {
+    setState(s => ({ ...s, requests: [{ id: crypto.randomUUID(), date: todayISO(), status: "Pending", ...req }, ...s.requests] }));
+  };
+  const addModel = (m) => {
+    setState(s => ({ ...s, models: [{ id: crypto.randomUUID(), accuracy: 0, status: "Training", ...m }, ...s.models] }));
+  };
+
+  // prepare leafet on demand
+  useEffect(() => {
+    (async () => {
+      // only initialize when user opens track or map-containing tabs
+      if (activeTab === "track" || activeTab === "history") {
+        await ensureLeaflet();
+        setLeafletReady(true);
+      }
+    })();
+  }, [activeTab]);
+
+  return (
+    <div className="min-h-screen flex flex-col bg-gradient-to-b from-emerald-50 to-white text-slate-800">
+      <Header state={state} onTabChange={setActiveTab} />
+      <main className="flex-1 max-w-5xl mx-auto w-full px-4 py-6">
+        {activeTab === "dashboard" && <Dashboard state={state} />}
+        {activeTab === "track" && <Track onAddTrip={addTrip} leafletReady={leafletReady} ensureLeaflet={ensureLeaflet} />}
+        {activeTab === "history" && <History state={state} leafletReady={leafletReady} ensureLeaflet={ensureLeaflet} />}
+        {activeTab === "modeling" && <ModelingDataset state={state} onAddModel={addModel} />}
+        {activeTab === "request" && <RequestDataset state={state} onAddRequest={addRequest} />}
+        {activeTab === "challenges" && <Challenges state={state} />}
+        {activeTab === "rewards" && <Rewards state={state} onRedeem={redeem} />}
+        {activeTab === "leaderboard" && <Leaderboard state={state} />}
+        {activeTab === "profile" && <Profile state={state} setState={setState} />}
+      </main>
+
+      {/* Bottom navigation (mobile shows 5 main tabs; desktop still uses Nav header) */}
+      <div className="block sm:hidden">
+        <BottomNav active={activeTab} onChange={setActiveTab} />
+      </div>
+
+      <footer className="hidden sm:block max-w-5xl mx-auto w-full px-4 py-4 text-xs text-slate-500">
+        *Nilai emisi & poin hanya contoh untuk demo. Integrasi real-world perlu verifikasi sumber resmi.
+      </footer>
+    </div>
+  );
+}
+
+/* ============================
+   Header & Nav
+   ============================ */
+function Header({ state, onTabChange }) {
+  return (
+    <header className="sticky top-0 z-20 bg-white/90 backdrop-blur border-b border-emerald-100">
+      <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-600 text-white font-bold">G</div>
+          <div>
+            <div className="text-lg font-semibold">GreenMiles — Demo</div>
+            <div className="text-xs text-slate-500 -mt-1">Gamifikasi mobilitas ramah lingkungan</div>
+          </div>
+        </div>
+
+        <div className="hidden sm:flex items-center gap-3">
+          <nav className="flex gap-2">
+            {[
+              { k: "dashboard", t: "Dashboard" },
+              { k: "track", t: "Tracking" },
+              { k: "history", t: "Riwayat" },
+              { k: "modeling", t: "Modeling" },
+              { k: "request", t: "Request DS" },
+              { k: "challenges", t: "Tantangan" },
+              { k: "rewards", t: "Reward" },
+              { k: "leaderboard", t: "Peringkat" },
+              { k: "profile", t: "Profil" },
+            ].map(tab => (
+              <button
+                key={tab.k}
+                onClick={() => onTabChange(tab.k)}
+                className="text-xs rounded-xl px-3 py-2 border bg-white text-slate-700 border-emerald-200 hover:bg-emerald-50"
+              >
+                {tab.t}
+              </button>
+            ))}
+          </nav>
+
+          <div className="ml-4 flex items-center gap-2">
+            <span className="text-sm px-2 py-1 rounded-full bg-emerald-100 text-emerald-700">Tier: {state.user.tier}</span>
+            <div className="text-sm text-slate-600">Poin: <strong>{fmt(state.totals.points)}</strong></div>
+          </div>
+        </div>
+
+        <div className="sm:hidden flex items-center gap-2">
+          <span className="text-sm px-2 py-1 rounded-full bg-emerald-100 text-emerald-700">Tier: {state.user.tier}</span>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/* Bottom nav (mobile) */
+function BottomNav({ active, onChange }) {
+  const tabs = [
+    { key: "dashboard", label: "🏠", text: "Home" },
+    { key: "track", label: "📍", text: "Track" },
+    { key: "challenges", label: "🎯", text: "Tantangan" },
+    { key: "rewards", label: "🎁", text: "Reward" },
+    { key: "profile", label: "👤", text: "Profil" },
+  ];
+  return (
+    <nav className="fixed bottom-0 left-0 right-0 bg-white border-t p-2 z-30">
+      <div className="max-w-5xl mx-auto grid grid-cols-5 gap-2">
+        {tabs.map(t => (
+          <button
+            key={t.key}
+            onClick={() => onChange(t.key)}
+            className={`flex flex-col items-center text-sm ${active === t.key ? "text-emerald-600" : "text-slate-500"}`}
+          >
+            <div className="text-xl">{t.label}</div>
+            <div className="text-[11px] mt-1">{t.text}</div>
+          </button>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
+/* ============================
+   Shared UI bits
+   ============================ */
+function Card({ title, right, children }) {
+  return (
+    <div className="rounded-2xl border bg-white p-5 shadow-sm">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-semibold">{title}</h3>
+        {right}
+      </div>
+      <div>{children}</div>
+    </div>
+  );
+}
+function Stat({ label, value, sub }) {
+  return (
+    <div className="rounded-2xl border bg-white p-4 shadow-sm">
+      <div className="text-sm text-slate-500">{label}</div>
+      <div className="text-2xl font-semibold mt-1">{value}</div>
+      {sub && <div className="text-xs text-slate-500 mt-1">{sub}</div>}
+    </div>
+  );
+}
+
+/* ============================
+   DASHBOARD
+   ============================ */
+function Dashboard({ state }) {
+  const kmTotal = fmt(state.totals.distanceKm);
+  const co2 = fmt(state.totals.co2Gram / 1000);
+  const saved = fmt(state.totals.co2SavedGram / 1000);
+  const pts = fmt(state.totals.points);
+
+  const weekly = groupBy(state.trips, t => getWeekIndex(new Date(t.date)));
+  const weekKeys = Object.keys(weekly).slice(0, 8);
+
+  return (
+    <div className="grid gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <Stat label="Total Jarak" value={`${kmTotal} km`} />
+        <Stat label="Emisi Terkumpul" value={`${co2} kg CO₂`} />
+        <Stat label="Emisi Dihemat" value={`${saved} kg CO₂`} />
+        <Stat label="GreenPoints" value={pts} />
+      </div>
+
+      <Card title="Emisi Mingguan (visual sederhana)">
+        <div className="flex gap-2 items-end min-h-[120px]">
+          {weekKeys.map(wk => {
+            const total = weekly[wk].reduce((a,t)=>a+t.co2Gram,0)/1000;
+            return (
+              <div key={wk} className="flex-1 text-center">
+                <div className="mx-auto w-6 rounded-t bg-emerald-400" style={{ height: `${Math.min(120, total)}px` }}></div>
+                <div className="text-[10px] mt-1">{wk.replace(/.*W/,"W")}</div>
+              </div>
+            );
+          })}
+          {weekKeys.length===0 && <div className="text-sm text-slate-500">Belum ada data minggu ini.</div>}
+        </div>
+      </Card>
+
+      <Card title="Ringkasan Perjalanan Terbaru">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500">
+              <th className="py-2">Tanggal</th><th>Moda</th><th>Jarak</th><th>Poin</th><th>Catatan</th>
+            </tr>
+          </thead>
+          <tbody>
+            {state.trips.slice(0,8).map(t => (
+              <tr key={t.id} className="border-t">
+                <td className="py-2">{t.date}</td>
+                <td>{MODE_LABELS[t.mode] || t.mode}</td>
+                <td>{(t.distanceKm || 0).toFixed(2)} km</td>
+                <td>{t.points}</td>
+                <td>{t.note || "-"}</td>
+              </tr>
+            ))}
+            {state.trips.length===0 && (
+              <tr><td colSpan={5} className="py-4 text-center text-slate-500">Belum ada perjalanan.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================
+   TRACK (MAP + GPS)
+   ============================ */
+function Track({ onAddTrip, leafletReady, ensureLeaflet }) {
+  const [libsReady, setLibsReady] = useState(leafletReady);
+  const [gpsSupported, setGpsSupported] = useState(typeof navigator !== "undefined" && "geolocation" in navigator);
+  const [watchId, setWatchId] = useState(null);
+  const [route, setRoute] = useState([]); // {lat,lng,ts}
+  const [isRecording, setIsRecording] = useState(false);
+  const [center, setCenter] = useState({ lat: -6.2, lng: 106.816666 });
+  const [mode, setMode] = useState("walk");
+  const startedAtRef = useRef(null);
+  const [distanceManual, setDistanceManual] = useState(2);
+  const [durationManual, setDurationManual] = useState(30);
+  const [errorMsg, setErrorMsg] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      await ensureLeaflet();
+      setLibsReady(true);
+    })();
+  }, [ensureLeaflet]);
+
+  useEffect(() => {
+    if (!gpsSupported) return;
+    navigator.geolocation.getCurrentPosition(pos => {
+      const { latitude, longitude } = pos.coords;
+      setCenter({ lat: latitude, lng: longitude });
+    }, ()=>{}, { enableHighAccuracy: true, timeout: 8000 });
+  }, [gpsSupported]);
+
+  const start = () => {
+    if (!gpsSupported) { setErrorMsg("Perangkat tidak mendukung GPS."); return; }
+    if (isRecording) return;
+    setErrorMsg("");
+    setRoute([]);
+    startedAtRef.current = Date.now();
+    const id = navigator.geolocation.watchPosition(pos => {
+      const { latitude, longitude } = pos.coords;
+      setRoute(prev => [...prev, { lat: latitude, lng: longitude, ts: Date.now() }]);
+      setCenter({ lat: latitude, lng: longitude });
+    }, err => setErrorMsg(err.message || "Gagal akses GPS"), { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 });
+    setWatchId(id);
+    setIsRecording(true);
+  };
+  const stop = () => {
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    setWatchId(null);
+    setIsRecording(false);
+    // compute distance/time to update preview fields (ke optional)
+    const distKm = calcRouteDistance(route);
+    const durMin = startedAtRef.current ? Math.max(1, Math.round((Date.now() - startedAtRef.current) / 60000)) : durationManual;
+    setDistanceManual(Number(distKm.toFixed(3)));
+    setDurationManual(durMin);
+  };
+  const saveRoute = () => {
+    const dist = calcRouteDistance(route);
+    const dur = startedAtRef.current ? Math.max(1, Math.round((Date.now()-startedAtRef.current)/60000)) : durationManual;
+    onAddTrip({ mode, distanceKm: Number(dist.toFixed(3)), durationMin: dur, note: "Direkam GPS", routeGeoJSON: { type: "Feature", properties:{mode}, geometry:{type:"LineString", coordinates:route.map(p=>[p.lng,p.lat]) } }, baselineMode: "car" });
+    setRoute([]); setIsRecording(false); setWatchId(null);
+  };
+  const manualSave = () => {
+    onAddTrip({ mode, distanceKm: km(distanceManual), durationMin: Math.max(1, Math.round(durationManual)), note: "Manual input", baselineMode: "car" });
+  };
+
+  const distPreview = calcRouteDistance(route);
+
+  return (
+    <div className="grid gap-4">
+      <Card title="Rekam Perjalanan dengan Peta (GPS)" right={<span className="text-xs text-slate-500">{gpsSupported ? "GPS ok" : "GPS tidak tersedia"}</span>}>
+        <div className="grid lg:grid-cols-2 gap-4">
+          <div className="grid gap-3">
+            <label className="text-sm">Moda</label>
+            <select value={mode} onChange={e=>setMode(e.target.value)} className="border rounded-xl px-3 py-2">
+              {Object.keys(MODE_LABELS).map(k => <option key={k} value={k}>{MODE_LABELS[k]}</option>)}
+            </select>
+
+            <div className="flex gap-2 mt-2">
+              {!isRecording ? (
+                <button onClick={start} className="rounded-xl bg-emerald-600 text-white px-4 py-2">Start</button>
+              ) : (
+                <button onClick={stop} className="rounded-xl bg-rose-600 text-white px-4 py-2">Stop</button>
+              )}
+              <button onClick={saveRoute} disabled={route.length<2} className={`rounded-xl px-4 py-2 ${route.length>=2 ? "bg-emerald-600 text-white" : "bg-slate-200 text-slate-500"}`}>Simpan dari Rute</button>
+            </div>
+
+            <div className="rounded-2xl border p-4 bg-emerald-50">
+              <div className="text-sm text-slate-600">Ringkasan Rute</div>
+              <div className="mt-2 grid grid-cols-2 gap-3">
+                <Stat label="Titik" value={route.length} />
+                <Stat label="Jarak (km)" value={distPreview.toFixed(3)} />
+                <Stat label="Durasi (menit)" value={startedAtRef.current ? Math.max(1, Math.round((Date.now()-startedAtRef.current)/60000)) : durationManual} />
+                <Stat label="Mode" value={MODE_LABELS[mode]} />
+              </div>
+              {errorMsg && <div className="text-xs text-rose-600 mt-2">{errorMsg}</div>}
+            </div>
+
+            <div className="rounded-2xl border p-4">
+              <div className="text-sm text-slate-600 mb-2">Input manual (jika tidak pakai GPS)</div>
+              <div className="grid grid-cols-2 gap-3">
+                <input type="number" value={distanceManual} onChange={e=>setDistanceManual(e.target.value)} className="border rounded-xl px-3 py-2" />
+                <input type="number" value={durationManual} onChange={e=>setDurationManual(e.target.value)} className="border rounded-xl px-3 py-2" />
+              </div>
+              <button onClick={manualSave} className="mt-3 rounded-xl bg-emerald-600 text-white px-4 py-2">Simpan (Manual)</button>
+            </div>
+          </div>
+
+          <div className="grid gap-3">
+            <div className="rounded-2xl border overflow-hidden">
+              <div className="h-[360px]">
+                {libsReady ? <LiveMap center={center} route={route} /> : <div className="h-full w-full flex items-center justify-center text-slate-500">Memuat peta…</div>}
+              </div>
+            </div>
+            <div className="rounded-2xl border p-4">
+              <div className="text-sm text-slate-600">Preview Emisi & Poin (estimasi)</div>
+              <div className="mt-3 grid grid-cols-2 gap-3">
+                <div className="text-sm">Jarak (km)</div><div className="text-sm">{distPreview.toFixed(3)}</div>
+                <div className="text-sm">Emisi (g)</div><div className="text-sm">{Math.round(calcTrip({ mode, distanceKm: distPreview }).co2Gram)}</div>
+                <div className="text-sm">Poin</div><div className="text-sm">{calcTrip({ mode, distanceKm: distPreview }).points}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* LiveMap uses lazily loaded Leaflet libs */
+function LiveMap({ center, route }) {
+  const { MapContainer, TileLayer, Marker, Polyline } = LeafletLibs;
+  if (!MapContainer) return <div className="h-full w-full flex items-center justify-center text-slate-500">Map libs tidak siap</div>;
+  return (
+    <MapContainer center={[center.lat, center.lng]} zoom={15} style={{ height: "100%", width: "100%" }}>
+      <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap" />
+      <Marker position={[center.lat, center.lng]} />
+      {route && route.length >= 2 && <Polyline positions={route.map(p=>[p.lat,p.lng])} />}
+    </MapContainer>
+  );
+}
+
+/* ============================
+   HISTORY
+   ============================ */
+function History({ state, leafletReady, ensureLeaflet }) {
+  // optionally show map of last route
+  useEffect(() => { if (!leafletReady) ensureLeaflet(); }, [leafletReady, ensureLeaflet]);
+
+  return (
+    <div className="grid gap-4">
+      <Card title="Semua Perjalanan (History)">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500">
+              <th className="py-2">Tanggal</th><th>Moda</th><th>Jarak</th><th>Poin</th><th>Emisi(g)</th><th>Catatan</th>
+            </tr>
+          </thead>
+          <tbody>
+            {state.trips.map(t => (
+              <tr key={t.id} className="border-t">
+                <td className="py-2">{t.date}</td>
+                <td>{MODE_LABELS[t.mode]}</td>
+                <td>{(t.distanceKm||0).toFixed(2)} km</td>
+                <td>{t.points}</td>
+                <td>{Math.round(t.co2Gram)}</td>
+                <td>{t.note || "-"}</td>
+              </tr>
+            ))}
+            {state.trips.length===0 && <tr><td colSpan={6} className="py-4 text-center text-slate-500">Belum ada perjalanan.</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================
+   MODELING DATASET
+   ============================ */
+function ModelingDataset({ state, onAddModel }) {
+  const [name, setName] = useState("");
+  const [category, setCategory] = useState("Computer Vision");
+  return (
+    <div className="grid gap-4">
+      <Card title="Daftar Model">
+        <div className="grid gap-3">
+          <div className="grid sm:grid-cols-3 gap-3">
+            {state.models.map(m => (
+              <div key={m.id} className="rounded-xl border p-3 bg-white">
+                <div className="font-medium">{m.name}</div>
+                <div className="text-xs text-slate-600">Kategori: {m.category}</div>
+                <div className="text-xs text-slate-600 mt-1">Status: {m.status} • Akurasi: {m.accuracy ? (m.accuracy*100).toFixed(1)+"%" : "-"}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Tambahkan Model Dummy">
+        <div className="grid sm:grid-cols-3 gap-3">
+          <input className="border rounded-xl px-3 py-2" placeholder="Nama model" value={name} onChange={e=>setName(e.target.value)} />
+          <input className="border rounded-xl px-3 py-2" placeholder="Kategori" value={category} onChange={e=>setCategory(e.target.value)} />
+          <button onClick={()=> { if(!name) return alert("Nama model kosong"); onAddModel({ name, category }); setName(""); }} className="rounded-xl bg-emerald-600 text-white px-4 py-2">Tambah</button>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================
+   REQUEST DATASET
+   ============================ */
+function RequestDataset({ state, onAddRequest }) {
+  const [title, setTitle] = useState("");
+  const [uploader, setUploader] = useState("");
+  const [notes, setNotes] = useState("");
+  const [fileName, setFileName] = useState("");
+
+  const submit = () => {
+    if (!title || !uploader) return alert("Isi title & uploader");
+    onAddRequest({ title, uploader, notes, fileName });
+    setTitle(""); setUploader(""); setNotes(""); setFileName("");
+  };
+
+  return (
+    <div className="grid gap-4">
+      <Card title="Form Request Dataset">
+        <div className="grid sm:grid-cols-2 gap-3">
+          <input placeholder="Judul dataset" value={title} onChange={e=>setTitle(e.target.value)} className="border rounded-xl px-3 py-2" />
+          <input placeholder="Uploader" value={uploader} onChange={e=>setUploader(e.target.value)} className="border rounded-xl px-3 py-2" />
+          <input placeholder="File name (mock)" value={fileName} onChange={e=>setFileName(e.target.value)} className="border rounded-xl px-3 py-2" />
+          <textarea placeholder="Catatan teknikal" value={notes} onChange={e=>setNotes(e.target.value)} className="border rounded-xl px-3 py-2 col-span-2" />
+          <div className="col-span-2 flex gap-2">
+            <button onClick={submit} className="rounded-xl bg-emerald-600 text-white px-4 py-2">Kirim Request (Mock)</button>
+            <button onClick={()=>{ setTitle(""); setUploader(""); setNotes(""); setFileName(""); }} className="rounded-xl border px-4 py-2">Reset</button>
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Riwayat Request">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500">
+              <th className="py-2">Tanggal</th><th>Judul</th><th>Uploader</th><th>Status</th><th>Catatan</th>
+            </tr>
+          </thead>
+          <tbody>
+            {state.requests.map(r => (
+              <tr key={r.id} className="border-t">
+                <td className="py-2">{r.date}</td>
+                <td>{r.title}</td>
+                <td>{r.uploader}</td>
+                <td>{r.status}</td>
+                <td>{r.notes || "-"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================
+   CHALLENGES, REWARDS, LEADERBOARD, PROFILE
+   ============================ */
+function Challenges({ state }) {
+  const c = state.challenges;
+  const dailyGoalKm = 3;
+  const weeklyGoalTransit = 5;
+  const monthlyGoalPct = 30;
+  return (
+    <div className="grid gap-4">
+      <Card title="Tantangan Harian">
+        <div className="grid sm:grid-cols-3 gap-3">
+          <div className="rounded-xl border p-4 bg-white">
+            <div className="text-sm text-slate-600">Jalan {c.dailyWalkKm.toFixed(1)} / {dailyGoalKm} km</div>
+            <Progress value={(c.dailyWalkKm/dailyGoalKm)*100} />
+          </div>
+          <div className="rounded-xl border p-4 bg-white">
+            <div className="text-sm text-slate-600">Transit {c.weeklyTransitCount} / {weeklyGoalTransit} kali</div>
+            <Progress value={(c.weeklyTransitCount/weeklyGoalTransit)*100} />
+          </div>
+          <div className="rounded-xl border p-4 bg-white">
+            <div className="text-sm text-slate-600">Reduksi {c.monthlyReductionPct}% / {monthlyGoalPct}%</div>
+            <Progress value={c.monthlyReductionPct} />
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Achievement">
+        <div className="flex gap-2">
+          <Chip label="Eco Explorer – 100 km jalan" achieved={state.trips.filter(t=>t.mode==='walk').reduce((a,t)=>a+t.distanceKm,0)>=100} />
+          <Chip label="Transit Hero – 50x transit" achieved={state.trips.filter(t=>['bus','krl','mrt'].includes(t.mode)).length>=50} />
+          <Chip label="Carbon Saver – 1 ton CO₂" achieved={state.totals.co2SavedGram>=1_000_000} />
+        </div>
+      </Card>
+    </div>
+  );
+}
+function Progress({ value }) {
+  const v = Math.max(0, Math.min(100, value || 0));
+  return (
+    <div>
+      <div className="text-xs text-slate-600 mb-1">{Math.round(v)}%</div>
+      <div className="h-3 bg-emerald-100 rounded-full overflow-hidden">
+        <div className="h-3 bg-emerald-500" style={{ width: `${v}%` }} />
+      </div>
+    </div>
+  );
+}
+function Chip({ label, achieved }) {
+  return <span className={`px-3 py-1 rounded-full border text-sm ${achieved ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-700 border-emerald-200'}`}>{label}</span>;
+}
+
+function Rewards({ state, onRedeem }) {
+  return (
+    <div className="grid gap-4">
+      <div className="grid sm:grid-cols-3 gap-3">
+        {state.rewards.map(r => (
+          <div key={r.id} className="rounded-xl border p-4 bg-white">
+            <div className="font-medium">{r.name}</div>
+            <div className="text-xs text-slate-600 mt-1">Biaya: {r.cost} pts • Stok: {r.stock}</div>
+            <button onClick={()=>onRedeem(r.id)} disabled={state.totals.points < r.cost || r.stock<=0} className={`mt-3 w-full rounded-xl px-4 py-2 ${state.totals.points < r.cost || r.stock<=0 ? 'bg-slate-200 text-slate-500' : 'bg-emerald-600 text-white'}`}>Tukar</button>
+          </div>
+        ))}
+      </div>
+
+      <Card title="Cara Kerja Penukaran (Rencana Integrasi)">
+        <ol className="list-decimal ml-5 text-sm text-slate-600 mt-2 space-y-1">
+          <li>Hubungkan merchant/UMKM via portal mitra.</li>
+          <li>Generate QR dinamis untuk setiap reward (sisi merchant).</li>
+          <li>Pemindaian QR dari aplikasi → verifikasi server → kurangi stok & poin.</li>
+          <li>Email/WhatsApp e-voucher terkirim otomatis.</li>
+        </ol>
+      </Card>
+    </div>
+  );
+}
+
+function Leaderboard({ state }) {
+  const rows = [...state.leaderboard].sort((a,b)=>b.points-a.points);
+  return (
+    <div>
+      <Card title="Peringkat Komunitas">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500"><th>#</th><th>Nama</th><th>Poin</th></tr>
+          </thead>
+          <tbody>
+            {rows.map((u,i) => <tr key={u.id} className="border-t"><td className="py-2">{i+1}</td><td>{u.name}</td><td>{fmt(u.points)}</td></tr>)}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+function Profile({ state, setState }) {
+  const [name, setName] = useState(state.user.name);
+  const resetAll = () => { if(!confirm("Reset semua data demo?")) return; localStorage.removeItem(STORAGE_KEY); window.location.reload(); };
+  return (
+    <div className="grid gap-4">
+      <Card title="Profil">
+        <div className="grid sm:grid-cols-2 gap-3">
+          <div>
+            <label className="text-sm">Nama</label>
+            <input className="border rounded-xl px-3 py-2 w-full" value={name} onChange={e=>setName(e.target.value)} />
+            <button onClick={()=> setState(s=>({...s, user: {...s.user, name}}))} className="mt-3 rounded-xl bg-emerald-600 text-white px-4 py-2">Simpan</button>
+          </div>
+          <div className="rounded-xl border p-4 bg-emerald-50">
+            <div className="text-sm">Faktor Emisi (gCO₂/km)</div>
+            <ul className="text-xs text-slate-700 mt-2">
+              {Object.entries(CO2_FACTORS_G_PER_KM).map(([k,v]) => <li key={k}>{MODE_LABELS[k]}: <strong>{v}</strong></li>)}
+            </ul>
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Pengaturan">
+        <div className="flex gap-2">
+          <button onClick={resetAll} className="rounded-xl border px-4 py-2">Reset Demo</button>
+          <span className="text-xs text-slate-500 self-center">Tip: gunakan <code>npm run dev -- --host</code> untuk akses dari HP (VLAN).</span>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================
+   UTIL
+   ============================ */
+function groupBy(arr, keyFn) {
+  return arr.reduce((acc, item) => {
+    const key = keyFn(item);
+    (acc[key] ||= []).push(item);
+    return acc;
+  }, {});
+}

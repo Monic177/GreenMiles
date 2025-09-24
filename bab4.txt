@@ -1,0 +1,162 @@
+# Bab 4: Metodologi Pengembangan (versi disesuaikan untuk implementasi Kotlin — Android Studio)
+
+Berikut adalah versi Bab 4 yang sudah diperbaiki dan difokuskan agar siap diimplementasikan menggunakan **Kotlin** di **Android Studio**. Saya menyusun dengan struktur teknis yang jelas—arsitektur, stack, alur data, komponen penting, serta checklist migrasi dari prototipe web (JS/localStorage) ke aplikasi Android native.
+
+---
+
+## 4.1 Gambaran Umum
+
+Metodologi pengembangan mengikuti pendekatan **modular, testable, dan battery-aware** untuk aplikasi mobile. Aplikasi dikembangkan sebagai native Android menggunakan Kotlin dengan arsitektur berbasis **MVVM + Repository** agar logika bisnis terpisah dari UI dan mudah diuji. Pengolahan sinyal sensor dan inferensi moda transportasi akan dilakukan on-device (TFLite / ML Kit) untuk privasi dan latensi rendah, sementara sinkronisasi data dan backup ke cloud dilakukan secara asinkron.
+
+---
+
+## 4.2 Teknologi & Library Utama
+
+* Bahasa & IDE: **Kotlin**, **Android Studio**.
+* UI: **Jetpack Compose** (atau XML jika preferensi); **Navigation-Compose**.
+* Arsitektur: **ViewModel**, **Kotlin Coroutines**, **Flow**.
+* Dependency Injection: **Hilt (Dagger-Hilt)**.
+* Persistence: **Room** (relational) + **DataStore / SharedPreferences** untuk konfigurasi ringkas.
+* Networking: **Retrofit** + **OkHttp** + **Moshi/Gson**.
+* Background / Scheduling: **WorkManager** untuk upload/penjadwalan sinkronisasi.
+* Location / Sensor: **FusedLocationProviderClient (Play Services)**, **SensorManager** (accelerometer, gyroscope).
+* Camera / Evidence: **CameraX** untuk foto/video, **ExoPlayer** untuk preview video.
+* Maps & Routing: **Google Maps SDK** atau **Mapbox SDK**; untuk snap-to-road bisa memakai Mapbox Directions / Map Matching API, atau panggilan ke OSRM server (REST).
+* On-device ML: **TensorFlow Lite** (model klasifikasi moda), atau **Firebase ML / ML Kit** jika ingin integrasi cepat.
+* Media & File: **Scoped Storage** / SAF untuk penyimpanan evidence.
+* CI/CD: **GitHub Actions** / Bitrise untuk build dan pengujian.
+
+---
+
+## 4.3 Arsitektur Sistem (high level)
+
+1. **UI Layer (Compose + ViewModel)**
+
+   * Menampilkan dashboard, tracking, history, profile, about.
+2. **Domain Layer (UseCases / ViewModel)**
+
+   * Logika: deteksi moda, perhitungan emisi, perhitungan poin, aturan suspicious speed.
+3. **Data Layer (Repository)**
+
+   * Sumber: Room (local), Remote API (backend / OSRM), File storage (evidence).
+   * Sinkronisasi via WorkManager.
+4. **ML Engine (On-device)**
+
+   * Model TFLite untuk klasifikasi moda; pipeline training di server/desktop (Python + TF), kemudian convert → TFLite.
+5. **Sync & Backup**
+
+   * Upload/restore via REST API atau Firebase; export/import LS setara menggunakan file JSON lewat SAF.
+
+---
+
+## 4.4 Skema Data (contoh tabel Room)
+
+* `User` (id, username, displayName, tier, email, phone)
+* `Trip` (id, userId, dateIso, mode, distanceKm, durationMin, co2Gram, co2SavedGram, points, note, suspicious, evidenceUri, maxSpeedKmh, snappedBool)
+* `TripPoint` (id, tripId, lat, lng, timestamp) — untuk menyimpan rute titik demi titik (opsional: kompresi/cluster)
+* `Reward` (id, name, cost, stock)
+* `LeaderboardEntry` (id, name, points)
+  Catatan: gunakan **type converters** untuk menyimpan struktur GeoJSON bila perlu.
+
+---
+
+## 4.5 Sensor & Deteksi Moda Transportasi
+
+* **Sumber data**: GPS (lat,lon,accuracy,time), accelerometer, gyroscope, barometer (opsional).
+* **Preprocessing**: smoothing GPS (sliding window), resampling, low-pass filter pada accelerometer.
+* **Model**: latih model klasifikasi (CNN / LSTM / hybrid) dengan fitur statistik (speed, accel variance, step frequency).
+* **Pipeline training**: kumpulkan dataset lapangan, label manual → train di Python → quantize + convert ke TFLite.
+* **Inference**: jalankan model di device menggunakan TFLite Interpreter (coroutines) — hasil diberi confidence; fallback ke rule-based bila confidence rendah.
+
+Metrik evaluasi: akurasi, precision/recall per kelas, confusion matrix, latency inference, dan konsumsi baterai.
+
+---
+
+## 4.6 Tracking & Pengelolaan Rute
+
+* **Real-time tracking**: gunakan `FusedLocationProviderClient` dengan `LocationRequest` yang dioptimalkan (PRIORITY\_HIGH\_ACCURACY hanya saat recording).
+* **Simpan titik** ke `TripPoint` selama rekaman; batasi frekuensi untuk hemat baterai (mis. tiap 1–3 detik atau jarak > 3–10 m).
+* **Snap-to-road**:
+
+  * Opsi 1: panggil **Map Matching API** (Mapbox) atau **OSRM** -> dapatkan path ter-snap;
+  * Opsi 2: jika offline/no network, tampilkan polyline hasil smoothing lokal.
+* **Threshold auto-save**: jika distance ≥ `AUTO_SAVE_MIN_METERS` (mis. 30m) → simpan sebagai trip.
+* **Deteksi suspicious**: hitung `maxSpeedKmh` antar titik; tandai jika > `SUSPICIOUS_SPEED_KMH`.
+
+---
+
+## 4.7 Bukti (Evidence) — foto/video
+
+* Gunakan **CameraX** untuk capture; simpan ke internal app directory (Scoped Storage) dan simpan URI di kolom `evidenceUri`.
+* Untuk preview gunakan **ImageView / ExoPlayer**.
+* Data evidence **tidak** diupload otomatis ke cloud kecuali pengguna setuju; apabila diupload, lakukan enkripsi/secure transfer (HTTPS + token).
+
+---
+
+## 4.8 Penyimpanan & Sinkronisasi
+
+* **Local first**: semua data tersimpan di Room.
+* **Sync strategy**: WorkManager menjalankan job periódik / on-demand untuk mengupload trip ke backend (retry strategy, exponential backoff).
+* **Export/Import**: implementasikan export JSON via SAF (Storage Access Framework) untuk backup antar-device (setara fitur Export/Import localStorage).
+* **Konflik**: gunakan timestamp + last-write-wins atau server side merging untuk konflik sederhana.
+
+---
+
+## 4.9 Keamanan & Privasi
+
+* Permissions: `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`, `FOREGROUND_SERVICE` (jika persistent tracking), `CAMERA`, `READ_EXTERNAL_STORAGE`/`WRITE` sesuai Scoped Storage. Untuk background location pada Android 11+, minta `ACCESS_BACKGROUND_LOCATION` dengan justification UI.
+* Jelasakan di Privacy Policy: penyimpanan lokal, opsi upload, retention, dan cara menghapus data.
+* Data in transit: HTTPS (TLS1.2+), token auth (JWT/OAuth).
+* Penyimpanan sensitif: hindari menyimpan evidence dalam SharedPreferences; gunakan file storage dengan kontrol akses.
+
+---
+
+## 4.10 Testing & Validasi
+
+* Unit test: ViewModel, business logic (perhitungan emisi, poin).
+* Instrumentation test: Room DB, repository, UI flows (Compose testing).
+* Integration / E2E: WorkManager jobs, camera flow, location tracking simulasi (fused location mock).
+* Field testing: kumpulkan data lapangan untuk validasi model moda transportasi (labelling dan retraining).
+* Evaluasi model on-device: ukur akurasi per kelas, false positive suspicious flag, serta efek pada baterai.
+
+---
+
+## 4.11 Migrasi konsep web → implementasi Android (ceklist)
+
+* `localStorage` → **Room** (trip + user) + **DataStore** untuk preferensi.
+* `routeGeoJSON.geometry.coordinates` → simpan sebagai list `TripPoint` atau serialized GeoJSON di Room.
+* Leaflet maps → **Google Maps / Mapbox** (implementasi Polyline & camera fitBounds).
+* Fetch OSRM via `fetch` → **Retrofit** call ke OSRM endpoint atau Mapbox SDK.
+* FileReader dataURL evidence → **URI** (file path) + ContentResolver untuk baca/tulis.
+* `navigator.geolocation.watchPosition` → **FusedLocationProviderClient.requestLocationUpdates**; handle lifecycle & foreground service saat tracking kontinu.
+* Snap-to-road async flow → implementasi coroutine + error handling + caching.
+
+---
+
+## 4.12 Deployment & Operasional
+
+* Release build: sign APK / AAB, integrasi ProGuard/R8 rules untuk TFLite.
+* Monitoring: gunakan Firebase Crashlytics + analytics event (tracking start/stop, suspicious events, imports/exports).
+* QA: beta testing (internal/closed testing) → dapatkan feedback konsumsi baterai & akurasi.
+
+---
+
+## 4.13 Checklist MVP (fokus Kotlin)
+
+1. UI dasar (Compose) — dashboard, track, history, profile, about.
+2. Recording GPS with CameraX evidence + local save ke Room.
+3. Perhitungan jarak, co2, points (logic sesuai fungsi JS → pindahkan ke Kotlin UseCase).
+4. TFLite inference stub (rule-based fallback) → integrasi full model setelah data awal tersedia.
+5. Export/Import JSON via SAF.
+6. Snap-to-road via remote OSRM/Mapbox (best effort).
+7. Background sync via WorkManager (upload trip metadata — evidence optional).
+8. Testing: unit & instrumentation minimal.
+
+---
+
+Jika Anda mau, saya bisa langsung bantu:
+
+* Menuliskan **contoh skema Room entities** dan DAO dalam Kotlin; atau
+* Mengonversi fungsi-fungsi JavaScript penting (mis. `calcTrip`, `recomputeTotals`, `filterAndSmoothGps`, `haversineKm`) menjadi **Kotlin snippets** siap pakai.
+
+Mau saya lanjutkan ke konversi kode-kode utilitas itu sekarang?
